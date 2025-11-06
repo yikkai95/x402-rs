@@ -14,16 +14,16 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router, response::IntoResponse};
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::instrument;
 
 use crate::chain::FacilitatorLocalError;
 use crate::facilitator::Facilitator;
 use crate::facilitator_local::FacilitatorLocal;
 use crate::types::{
-    ErrorResponse, FacilitatorErrorReason, MixedAddress, SettleRequest, SettleContractRequest,
-    SettleContractRequestConversionError, SettleContractResponse, SettleResponse, VerifyRequest,
-    VerifyResponse,
+    ErrorResponse, FacilitatorErrorReason, MixedAddress, PaymentPayload, SettleContractRequest,
+    SettleContractRequestConversionError, SettleContractResponse, SettleRequest, SettleResponse,
+    VerifyRequest, VerifyResponse,
 };
 
 /// `GET /verify`: Returns a machine-readable description of the `/verify` endpoint.
@@ -53,9 +53,9 @@ const X_SETTLE_RECEIVER_HEADER: &str = "x-settle-receiver";
 ///
 /// This is served by the facilitator to describe the structure of a valid
 /// [`SettleRequest`] used to initiate on-chain payment settlement.
-/// 
+///
 /// Use header `X-Settle-Contract: <contract_address>` to use the settle contract function instead.
-/// If `X-Settle-Contract` is present, you can optionally use `X-Settle-Receiver: <receiver_address>` 
+/// If `X-Settle-Contract` is present, you can optionally use `X-Settle-Receiver: <receiver_address>`
 /// to override the receiver address from the request body.
 #[instrument(skip_all)]
 pub async fn get_settle_info() -> impl IntoResponse {
@@ -178,7 +178,7 @@ where
     // Check if X-Settle-Contract header is present
     let use_contract = headers.contains_key(X_SETTLE_CONTRACT_HEADER);
     let has_receiver_header = headers.contains_key(X_SETTLE_RECEIVER_HEADER);
-    
+
     tracing::debug!(
         use_contract = use_contract,
         has_receiver_header = has_receiver_header,
@@ -186,7 +186,7 @@ where
         x_settle_receiver = ?headers.get(X_SETTLE_RECEIVER_HEADER).and_then(|h| h.to_str().ok()),
         "Processing /settle request"
     );
-    
+
     if use_contract {
         // Handle settle contract request
         let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
@@ -196,32 +196,100 @@ where
                     error = ?e,
                     "Failed to read request body for settle contract request"
                 );
-                return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                    error: format!("Failed to read body: {}", e),
-                })).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Failed to read body: {}", e),
+                    }),
+                )
+                    .into_response();
             }
         };
-        
-        // Try to parse as SettleContractRequest or convert from a legacy SettleRequest body
-        let mut contract_request = match serde_json::from_slice::<SettleContractRequest>(&body_bytes) {
-            Ok(request) => request,
-            Err(contract_err) => {
-                match serde_json::from_slice::<SettleRequest>(&body_bytes) {
-                    Ok(legacy_request) => match SettleContractRequest::try_from(&legacy_request) {
-                        Ok(request) => {
-                            tracing::debug!(
-                                "Converted legacy settle body into SettleContractRequest"
+
+        // Try to parse as SettleContractRequest or convert legacy bodies
+        let mut contract_request =
+            match serde_json::from_slice::<SettleContractRequest>(&body_bytes) {
+                Ok(request) => request,
+                Err(contract_err) => {
+                    let value: Value = match serde_json::from_slice(&body_bytes) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let body_preview =
+                                String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)]);
+                            tracing::error!(
+                                error = ?contract_err,
+                                body_preview = %body_preview,
+                                body_length = body_bytes.len(),
+                                "Failed to parse SettleContractRequest"
                             );
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "Failed to parse SettleContractRequest: {}",
+                                        contract_err
+                                    ),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let payload_value = match value.get("paymentPayload") {
+                        Some(v) => v.clone(),
+                        None => {
+                            tracing::error!(
+                                "Request body for contract settle missing paymentPayload field"
+                            );
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: "Request body missing paymentPayload field".to_string(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                    };
+
+                    let payment_payload: PaymentPayload =
+                        match serde_json::from_value(payload_value) {
+                            Ok(payload) => payload,
+                            Err(payload_err) => {
+                                tracing::error!(
+                                    error = ?payload_err,
+                                    "Failed to parse paymentPayload when converting settle body"
+                                );
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(ErrorResponse {
+                                        error: format!(
+                                            "Failed to parse paymentPayload: {}",
+                                            payload_err
+                                        ),
+                                    }),
+                                )
+                                    .into_response();
+                            }
+                        };
+
+                    match SettleContractRequest::try_from(&payment_payload) {
+                        Ok(request) => {
+                            tracing::debug!("Converted paymentPayload into SettleContractRequest");
                             request
                         }
                         Err(convert_err) => {
-                            let error_message = match &convert_err {
-                                SettleContractRequestConversionError::UnsupportedScheme(scheme) => 
-                                    format!("Unsupported settle scheme for contract call: {scheme}"),
-                                SettleContractRequestConversionError::UnsupportedNetwork(network) =>
-                                    format!("Unsupported settle network for contract call: {network}"),
-                                SettleContractRequestConversionError::UnsupportedPayload =>
-                                    "Contract settle expects an EVM payment payload".to_string(),
+                            let error_message = match convert_err {
+                                SettleContractRequestConversionError::UnsupportedScheme(scheme) => {
+                                    format!("Unsupported settle scheme for contract call: {scheme}")
+                                }
+                                SettleContractRequestConversionError::UnsupportedNetwork(
+                                    network,
+                                ) => format!(
+                                    "Unsupported settle network for contract call: {network}"
+                                ),
+                                SettleContractRequestConversionError::UnsupportedPayload => {
+                                    "Contract settle expects an EVM payment payload".to_string()
+                                }
                             };
 
                             tracing::error!(
@@ -229,33 +297,17 @@ where
                                 message = %error_message,
                                 "Failed to convert legacy settle request"
                             );
-                            return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                                error: error_message,
-                            }))
-                            .into_response();
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse {
+                                    error: error_message,
+                                }),
+                            )
+                                .into_response();
                         }
-                    },
-                    Err(_) => {
-                        let body_preview = String::from_utf8_lossy(
-                            &body_bytes[..body_bytes.len().min(500)]
-                        );
-                        tracing::error!(
-                            error = ?contract_err,
-                            body_preview = %body_preview,
-                            body_length = body_bytes.len(),
-                            "Failed to parse SettleContractRequest"
-                        );
-                        return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                            error: format!(
-                                "Failed to parse SettleContractRequest: {}",
-                                contract_err
-                            ),
-                        }))
-                        .into_response();
                     }
                 }
-            }
-        };
+            };
 
         // If X-Settle-Receiver header is present, replace the receiver in the request
         if let Some(receiver_header) = headers.get(X_SETTLE_RECEIVER_HEADER) {
@@ -275,16 +327,24 @@ where
                             receiver_header_value = %receiver_str,
                             "Invalid X-Settle-Receiver header value"
                         );
-                        return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                            error: format!("Invalid X-Settle-Receiver header value: {}", e),
-                        })).into_response();
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: format!("Invalid X-Settle-Receiver header value: {}", e),
+                            }),
+                        )
+                            .into_response();
                     }
                 }
             } else {
                 tracing::error!("X-Settle-Receiver header contains invalid UTF-8");
-                return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                    error: "X-Settle-Receiver header contains invalid UTF-8".to_string(),
-                })).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "X-Settle-Receiver header contains invalid UTF-8".to_string(),
+                    }),
+                )
+                    .into_response();
             }
         }
 
@@ -332,37 +392,44 @@ where
                     error = ?e,
                     "Failed to read request body for regular settle request"
                 );
-                return (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                    error: format!("Failed to read body: {}", e),
-                })).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Failed to read body: {}", e),
+                    }),
+                )
+                    .into_response();
             }
         };
-        
+
         match serde_json::from_slice::<SettleRequest>(&body_bytes) {
-            Ok(settle_request) => {
-                match facilitator.settle(&settle_request).await {
-                    Ok(valid_response) => (StatusCode::OK, Json(valid_response)).into_response(),
-                    Err(error) => {
-                        tracing::warn!(
-                            error = ?error,
-                            body = %String::from_utf8_lossy(&body_bytes),
-                            "Settlement failed"
-                        );
-                        error.into_response()
-                    }
+            Ok(settle_request) => match facilitator.settle(&settle_request).await {
+                Ok(valid_response) => (StatusCode::OK, Json(valid_response)).into_response(),
+                Err(error) => {
+                    tracing::warn!(
+                        error = ?error,
+                        body = %String::from_utf8_lossy(&body_bytes),
+                        "Settlement failed"
+                    );
+                    error.into_response()
                 }
-            }
+            },
             Err(e) => {
-                let body_preview = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)]);
+                let body_preview =
+                    String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(500)]);
                 tracing::error!(
                     error = ?e,
                     body_preview = %body_preview,
                     body_length = body_bytes.len(),
                     "Failed to parse SettleRequest"
                 );
-                (StatusCode::BAD_REQUEST, Json(ErrorResponse {
-                    error: format!("Failed to parse SettleRequest: {}", e),
-                })).into_response()
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Failed to parse SettleRequest: {}", e),
+                    }),
+                )
+                    .into_response()
             }
         }
     }
@@ -380,13 +447,15 @@ where
     // Use std::any to check if we can downcast
     use std::any::Any;
     use std::sync::Arc;
-    
+
     // Try to downcast as Arc<FacilitatorLocal> first (since that's what's passed in main.rs)
-    if let Some(arc_facilitator_local) = (facilitator as &dyn Any).downcast_ref::<Arc<FacilitatorLocal<crate::provider_cache::ProviderCache>>>() {
+    if let Some(arc_facilitator_local) = (facilitator as &dyn Any)
+        .downcast_ref::<Arc<FacilitatorLocal<crate::provider_cache::ProviderCache>>>()
+    {
         arc_facilitator_local.settle_contract(request).await
     } else {
         Err(FacilitatorLocalError::ContractCall(
-            "Settle contract requires FacilitatorLocal (wrapped in Arc)".to_string()
+            "Settle contract requires FacilitatorLocal (wrapped in Arc)".to_string(),
         ))
     }
 }

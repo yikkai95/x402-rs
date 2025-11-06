@@ -16,7 +16,7 @@ use crate::chain::NetworkProvider;
 use crate::facilitator::Facilitator;
 use crate::provider_cache::ProviderMap;
 use crate::types::{
-    SettleRequest, SettleResponse, SettleContractRequest, SettleContractResponse,
+    SettleContractRequest, SettleContractResponse, SettleRequest, SettleResponse,
     SupportedPaymentKindsResponse, VerifyRequest, VerifyResponse,
 };
 
@@ -56,7 +56,7 @@ impl<A> FacilitatorLocal<A> {
             .provider_map
             .by_network(request.network)
             .ok_or(FacilitatorLocalError::UnsupportedNetwork(None))?;
-        
+
         // We need to extract EvmProvider from NetworkProvider, but provider is a reference
         // So we pattern match and borrow the inner value
         let evm_provider = match provider {
@@ -76,29 +76,52 @@ impl<A> FacilitatorLocal<A> {
         let nonce = FixedBytes(request.nonce);
         let signature = Bytes::from(request.signature.clone());
 
-        let receipt = evm_provider
-            .settle_contract(
-                from,
-                receiver,
-                amount,
-                valid_after,
-                valid_before,
-                nonce,
-                signature,
-                request.confirmations,
-            )
-            .await?;
+        if request.confirmations == 0 {
+            let tx_hash = evm_provider
+                .settle_contract_pending(
+                    from,
+                    receiver,
+                    amount,
+                    valid_after,
+                    valid_before,
+                    nonce,
+                    signature,
+                    request.confirmations,
+                )
+                .await?;
 
-        let success = receipt.status();
-        Ok(SettleContractResponse {
-            success,
-            error_reason: if success {
-                None
-            } else {
-                Some(crate::types::FacilitatorErrorReason::InvalidScheme)
-            },
-            transaction: Some(crate::types::TransactionHash::Evm(receipt.transaction_hash.0)),
-        })
+            Ok(SettleContractResponse {
+                success: true,
+                error_reason: None,
+                transaction: Some(crate::types::TransactionHash::Evm(tx_hash)),
+            })
+        } else {
+            let receipt = evm_provider
+                .settle_contract(
+                    from,
+                    receiver,
+                    amount,
+                    valid_after,
+                    valid_before,
+                    nonce,
+                    signature,
+                    request.confirmations,
+                )
+                .await?;
+
+            let success = receipt.status();
+            Ok(SettleContractResponse {
+                success,
+                error_reason: if success {
+                    None
+                } else {
+                    Some(crate::types::FacilitatorErrorReason::InvalidScheme)
+                },
+                transaction: Some(crate::types::TransactionHash::Evm(
+                    receipt.transaction_hash.0,
+                )),
+            })
+        }
     }
 }
 

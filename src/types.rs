@@ -789,8 +789,8 @@ impl<'de> Deserialize<'de> for TransactionHash {
         // Solana: base58 string, decodes to exactly 64 bytes
         if let Ok(bytes) = bs58::decode(&s).into_vec() {
             if bytes.len() == 64 {
-            let array: [u8; 64] = bytes.try_into().unwrap(); // safe after length check
-            return Ok(TransactionHash::Solana(array));
+                let array: [u8; 64] = bytes.try_into().unwrap(); // safe after length check
+                return Ok(TransactionHash::Solana(array));
             }
         }
 
@@ -956,7 +956,10 @@ pub struct SettleContractRequest {
     /// Not valid at/after this timestamp (exclusive).
     pub valid_before: UnixTimestamp,
     /// Unique 32-byte nonce (prevents replay), hex-encoded.
-    #[serde(serialize_with = "hex_serde::serialize", deserialize_with = "hex_serde::deserialize_fixed32")]
+    #[serde(
+        serialize_with = "hex_serde::serialize",
+        deserialize_with = "hex_serde::deserialize_fixed32"
+    )]
     pub nonce: [u8; 32],
     /// Signature bytes, hex-encoded.
     #[serde(with = "hex_serde")]
@@ -967,11 +970,10 @@ pub struct SettleContractRequest {
 }
 
 fn default_confirmations() -> u64 {
-    1
+    0
 }
 
-/// Errors that can occur when converting a legacy settle request into a
-/// [`SettleContractRequest`].
+/// Errors that can occur when converting into a [`SettleContractRequest`].
 #[derive(Debug, thiserror::Error)]
 pub enum SettleContractRequestConversionError {
     #[error("settle contract requires scheme 'exact', got {0}")]
@@ -982,36 +984,33 @@ pub enum SettleContractRequestConversionError {
     UnsupportedPayload,
 }
 
-impl TryFrom<&VerifyRequest> for SettleContractRequest {
+impl TryFrom<&PaymentPayload> for SettleContractRequest {
     type Error = SettleContractRequestConversionError;
 
-    fn try_from(request: &VerifyRequest) -> Result<Self, Self::Error> {
-        if request.payment_payload.scheme != Scheme::Exact {
+    fn try_from(payload: &PaymentPayload) -> Result<Self, Self::Error> {
+        if payload.scheme != Scheme::Exact {
             return Err(SettleContractRequestConversionError::UnsupportedScheme(
-                request.payment_payload.scheme,
+                payload.scheme,
             ));
         }
 
-        if !matches!(
-            NetworkFamily::from(request.payment_payload.network),
-            NetworkFamily::Evm
-        ) {
+        if !matches!(NetworkFamily::from(payload.network), NetworkFamily::Evm) {
             return Err(SettleContractRequestConversionError::UnsupportedNetwork(
-                request.payment_payload.network,
+                payload.network,
             ));
         }
 
-        let evm_payload = match &request.payment_payload.payload {
+        let evm_payload = match &payload.payload {
             ExactPaymentPayload::Evm(payload) => payload,
             ExactPaymentPayload::Solana(_) => {
-                return Err(SettleContractRequestConversionError::UnsupportedPayload)
+                return Err(SettleContractRequestConversionError::UnsupportedPayload);
             }
         };
 
         let authorization = &evm_payload.authorization;
 
         Ok(Self {
-            network: request.payment_payload.network,
+            network: payload.network,
             from: authorization.from,
             receiver: authorization.to,
             amount: authorization.value,
@@ -1021,6 +1020,14 @@ impl TryFrom<&VerifyRequest> for SettleContractRequest {
             signature: evm_payload.signature.0.clone(),
             confirmations: default_confirmations(),
         })
+    }
+}
+
+impl TryFrom<&VerifyRequest> for SettleContractRequest {
+    type Error = SettleContractRequestConversionError;
+
+    fn try_from(request: &VerifyRequest) -> Result<Self, Self::Error> {
+        SettleContractRequest::try_from(&request.payment_payload)
     }
 }
 
@@ -1108,7 +1115,7 @@ mod tests {
     use url::Url;
 
     #[test]
-    fn converts_verify_request_into_contract_request() {
+    fn converts_verify_or_payload_into_contract_request() {
         let from = EvmAddress(address!("0x1111111111111111111111111111111111111111"));
         let to = EvmAddress(address!("0x2222222222222222222222222222222222222222"));
         let nonce = HexEncodedNonce([5u8; 32]);
@@ -1133,6 +1140,8 @@ mod tests {
             }),
         };
 
+        let expected_from_payload = SettleContractRequest::try_from(&payment_payload).unwrap();
+
         let payment_requirements = PaymentRequirements {
             scheme: Scheme::Exact,
             network: Network::Base,
@@ -1149,21 +1158,49 @@ mod tests {
 
         let verify_request = VerifyRequest {
             x402_version: X402Version::V1,
-            payment_payload,
+            payment_payload: payment_payload.clone(),
             payment_requirements,
         };
 
-        let contract_request = SettleContractRequest::try_from(&verify_request).unwrap();
+        let expected_from_verify = SettleContractRequest::try_from(&verify_request).unwrap();
 
-        assert_eq!(contract_request.network, Network::Base);
-        assert_eq!(contract_request.from, from);
-        assert_eq!(contract_request.receiver, to);
-        assert_eq!(contract_request.amount, authorization.value);
-        assert_eq!(contract_request.valid_after, authorization.valid_after);
-        assert_eq!(contract_request.valid_before, authorization.valid_before);
-        assert_eq!(contract_request.nonce, nonce.0);
-        assert_eq!(contract_request.signature, signature_bytes);
-        assert_eq!(contract_request.confirmations, 1);
+        assert_eq!(expected_from_payload.network, Network::Base);
+        assert_eq!(expected_from_payload.from, from);
+        assert_eq!(expected_from_payload.receiver, to);
+        assert_eq!(expected_from_payload.amount, authorization.value);
+        assert_eq!(expected_from_payload.valid_after, authorization.valid_after);
+        assert_eq!(
+            expected_from_payload.valid_before,
+            authorization.valid_before
+        );
+        assert_eq!(expected_from_payload.nonce, nonce.0);
+        assert_eq!(expected_from_payload.signature, signature_bytes);
+        assert_eq!(expected_from_payload.confirmations, 1);
+
+        assert_eq!(expected_from_payload.network, expected_from_verify.network);
+        assert_eq!(expected_from_payload.from, expected_from_verify.from);
+        assert_eq!(
+            expected_from_payload.receiver,
+            expected_from_verify.receiver
+        );
+        assert_eq!(expected_from_payload.amount, expected_from_verify.amount);
+        assert_eq!(
+            expected_from_payload.valid_after,
+            expected_from_verify.valid_after
+        );
+        assert_eq!(
+            expected_from_payload.valid_before,
+            expected_from_verify.valid_before
+        );
+        assert_eq!(expected_from_payload.nonce, expected_from_verify.nonce);
+        assert_eq!(
+            expected_from_payload.signature,
+            expected_from_verify.signature
+        );
+        assert_eq!(
+            expected_from_payload.confirmations,
+            expected_from_verify.confirmations
+        );
     }
 
     #[test]

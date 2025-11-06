@@ -27,7 +27,8 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{
-    Identity, MULTICALL3_ADDRESS, MulticallItem, Provider, RootProvider, WalletProvider,
+    Identity, MULTICALL3_ADDRESS, MulticallItem, PendingTransactionBuilder, Provider, RootProvider,
+    WalletProvider,
 };
 use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
@@ -94,6 +95,9 @@ sol! {
 /// If absent on a target chain, verification will fail; you should deploy the validator there.
 const VALIDATOR_ADDRESS: alloy::primitives::Address =
     address!("0xdAcD51A54883eb67D95FAEb2BBfdC4a9a6BD2a3B");
+
+/// Minimum priority fee to keep transaction tips around one cent for ~90k gas (Base @ ~$3k/ETH).
+const MIN_PRIORITY_FEE_WEI: u128 = 20_000_000; // 2 gwei
 
 /// Combined filler type for gas, blob gas, nonce, and chain ID.
 type InnerFiller = JoinFill<
@@ -251,14 +255,48 @@ impl EvmProvider {
     /// Returns [`FacilitatorLocalError::ContractCall`] if the environment variable is not set
     /// or if the address cannot be parsed.
     fn settle_contract_address() -> Result<Address, FacilitatorLocalError> {
-        let addr_str = std::env::var(from_env::ENV_SETTLE_CONTRACT_ADDRESS)
-            .map_err(|e| FacilitatorLocalError::ContractCall(format!(
+        let addr_str = std::env::var(from_env::ENV_SETTLE_CONTRACT_ADDRESS).map_err(|e| {
+            FacilitatorLocalError::ContractCall(format!(
                 "Failed to read {}: {e}",
                 from_env::ENV_SETTLE_CONTRACT_ADDRESS
-            )))?;
-        Address::from_str(&addr_str).map_err(|e| FacilitatorLocalError::ContractCall(format!(
-            "Invalid settle contract address: {e}"
-        )))
+            ))
+        })?;
+        Address::from_str(&addr_str).map_err(|e| {
+            FacilitatorLocalError::ContractCall(format!("Invalid settle contract address: {e}"))
+        })
+    }
+
+    async fn submit_transaction(
+        &self,
+        tx: &MetaTransaction,
+    ) -> Result<PendingTransactionBuilder<AlloyEthereum>, FacilitatorLocalError> {
+        let mut txr = TransactionRequest::default()
+            .with_to(tx.to)
+            .with_from(self.next_signer_address())
+            .with_input(tx.calldata.clone());
+        if self.eip1559 {
+            txr.set_max_priority_fee_per_gas(MIN_PRIORITY_FEE_WEI);
+        } else {
+            let provider = &self.inner;
+            let gas: u128 = provider
+                .get_gas_price()
+                .instrument(tracing::info_span!("get_gas_price"))
+                .await
+                .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+            txr.set_gas_price(gas);
+        }
+
+        self.inner
+            .send_transaction(txr)
+            .await
+            .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))
+    }
+
+    pub async fn broadcast_transaction(
+        &self,
+        tx: MetaTransaction,
+    ) -> Result<PendingTransactionBuilder<AlloyEthereum>, FacilitatorLocalError> {
+        self.submit_transaction(&tx).await
     }
 
     /// Call the settle contract function with the provided parameters.
@@ -301,8 +339,16 @@ impl EvmProvider {
     ) -> Result<TransactionReceipt, FacilitatorLocalError> {
         let contract_address = Self::settle_contract_address()?;
         let contract = SettleContract::new(contract_address, &self.inner);
-        let settle_call = contract.settle(from, receiver, amount, valid_after, valid_before, nonce, signature);
-        
+        let settle_call = contract.settle(
+            from,
+            receiver,
+            amount,
+            valid_after,
+            valid_before,
+            nonce,
+            signature,
+        );
+
         self.send_transaction(MetaTransaction {
             to: settle_call.target(),
             calldata: settle_call.calldata().clone(),
@@ -320,6 +366,52 @@ impl EvmProvider {
             otel.kind = "client",
         ))
         .await
+    }
+
+    #[instrument(skip(self, signature), err)]
+    pub async fn settle_contract_pending(
+        &self,
+        from: Address,
+        receiver: Address,
+        amount: U256,
+        valid_after: U256,
+        valid_before: U256,
+        nonce: FixedBytes<32>,
+        signature: Bytes,
+        confirmations: u64,
+    ) -> Result<[u8; 32], FacilitatorLocalError> {
+        let contract_address = Self::settle_contract_address()?;
+        let contract = SettleContract::new(contract_address, &self.inner);
+        let settle_call = contract.settle(
+            from,
+            receiver,
+            amount,
+            valid_after,
+            valid_before,
+            nonce,
+            signature,
+        );
+
+        let pending = self
+            .broadcast_transaction(MetaTransaction {
+                to: settle_call.target(),
+                calldata: settle_call.calldata().clone(),
+                confirmations,
+            })
+            .instrument(tracing::info_span!(
+                "call_settle_contract",
+                from = %from,
+                receiver = %receiver,
+                amount = %amount,
+                valid_after = %valid_after,
+                valid_before = %valid_before,
+                nonce = %hex::encode(nonce),
+                contract_address = %contract_address,
+                otel.kind = "client",
+            ))
+            .await?;
+
+        Ok((*pending.tx_hash()).into())
     }
 }
 
@@ -393,26 +485,10 @@ impl MetaEvmProvider for EvmProvider {
         &self,
         tx: MetaTransaction,
     ) -> Result<TransactionReceipt, Self::Error> {
-        let mut txr = TransactionRequest::default()
-            .with_to(tx.to)
-            .with_from(self.next_signer_address())
-            .with_input(tx.calldata);
-        if !self.eip1559 {
-            let provider = &self.inner;
-            let gas: u128 = provider
-                .get_gas_price()
-                .instrument(tracing::info_span!("get_gas_price"))
-                .await
-                .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
-            txr.set_gas_price(gas);
-        }
-        let pending_tx = self
-            .inner
-            .send_transaction(txr)
-            .await
-            .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+        let confirmations = tx.confirmations;
+        let pending_tx = self.submit_transaction(&tx).await?;
         pending_tx
-            .with_required_confirmations(tx.confirmations)
+            .with_required_confirmations(confirmations)
             .get_receipt()
             .await
             .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))
