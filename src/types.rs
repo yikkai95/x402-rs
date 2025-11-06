@@ -26,7 +26,7 @@ use std::ops::{Add, Div, Mul, Rem, Sub};
 use std::str::FromStr;
 use url::Url;
 
-use crate::network::Network;
+use crate::network::{Network, NetworkFamily};
 use crate::timestamp::UnixTimestamp;
 
 /// Represents the protocol version. Currently only version 1 is supported.
@@ -787,11 +787,11 @@ impl<'de> Deserialize<'de> for TransactionHash {
         }
 
         // Solana: base58 string, decodes to exactly 64 bytes
-        if let Ok(bytes) = bs58::decode(&s).into_vec()
-            && bytes.len() == 64
-        {
+        if let Ok(bytes) = bs58::decode(&s).into_vec() {
+            if bytes.len() == 64 {
             let array: [u8; 64] = bytes.try_into().unwrap(); // safe after length check
             return Ok(TransactionHash::Solana(array));
+            }
         }
 
         Err(serde::de::Error::custom("Invalid transaction hash format"))
@@ -939,6 +939,141 @@ pub struct SettleResponse {
     pub network: Network,
 }
 
+/// Request to call the settle contract function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleContractRequest {
+    /// Network to use for the settlement.
+    pub network: Network,
+    /// Address of the sender.
+    pub from: EvmAddress,
+    /// Address of the receiver.
+    pub receiver: EvmAddress,
+    /// Transfer amount (token units).
+    pub amount: TokenAmount,
+    /// Not valid before this timestamp (inclusive).
+    pub valid_after: UnixTimestamp,
+    /// Not valid at/after this timestamp (exclusive).
+    pub valid_before: UnixTimestamp,
+    /// Unique 32-byte nonce (prevents replay), hex-encoded.
+    #[serde(serialize_with = "hex_serde::serialize", deserialize_with = "hex_serde::deserialize_fixed32")]
+    pub nonce: [u8; 32],
+    /// Signature bytes, hex-encoded.
+    #[serde(with = "hex_serde")]
+    pub signature: Vec<u8>,
+    /// Number of block confirmations to wait for (default: 1).
+    #[serde(default = "default_confirmations")]
+    pub confirmations: u64,
+}
+
+fn default_confirmations() -> u64 {
+    1
+}
+
+/// Errors that can occur when converting a legacy settle request into a
+/// [`SettleContractRequest`].
+#[derive(Debug, thiserror::Error)]
+pub enum SettleContractRequestConversionError {
+    #[error("settle contract requires scheme 'exact', got {0}")]
+    UnsupportedScheme(Scheme),
+    #[error("settle contract requires an EVM network, got {0}")]
+    UnsupportedNetwork(Network),
+    #[error("settle contract currently supports only EVM payloads")]
+    UnsupportedPayload,
+}
+
+impl TryFrom<&VerifyRequest> for SettleContractRequest {
+    type Error = SettleContractRequestConversionError;
+
+    fn try_from(request: &VerifyRequest) -> Result<Self, Self::Error> {
+        if request.payment_payload.scheme != Scheme::Exact {
+            return Err(SettleContractRequestConversionError::UnsupportedScheme(
+                request.payment_payload.scheme,
+            ));
+        }
+
+        if !matches!(
+            NetworkFamily::from(request.payment_payload.network),
+            NetworkFamily::Evm
+        ) {
+            return Err(SettleContractRequestConversionError::UnsupportedNetwork(
+                request.payment_payload.network,
+            ));
+        }
+
+        let evm_payload = match &request.payment_payload.payload {
+            ExactPaymentPayload::Evm(payload) => payload,
+            ExactPaymentPayload::Solana(_) => {
+                return Err(SettleContractRequestConversionError::UnsupportedPayload)
+            }
+        };
+
+        let authorization = &evm_payload.authorization;
+
+        Ok(Self {
+            network: request.payment_payload.network,
+            from: authorization.from,
+            receiver: authorization.to,
+            amount: authorization.value,
+            valid_after: authorization.valid_after,
+            valid_before: authorization.valid_before,
+            nonce: authorization.nonce.0,
+            signature: evm_payload.signature.0.clone(),
+            confirmations: default_confirmations(),
+        })
+    }
+}
+
+/// Response from calling the settle contract function.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettleContractResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<FacilitatorErrorReason>,
+    pub transaction: Option<TransactionHash>,
+}
+
+mod hex_serde {
+    use alloy::hex;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hex_string = format!("0x{}", hex::encode(bytes));
+        serializer.serialize_str(&hex_string)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let hex_str = s.trim_start_matches("0x");
+        hex::decode(hex_str).map_err(serde::de::Error::custom)
+    }
+
+    pub fn deserialize_fixed32<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let hex_str = s.trim_start_matches("0x");
+        let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom(format!(
+                "Expected 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut array = [0u8; 32];
+        array.copy_from_slice(&bytes);
+        Ok(array)
+    }
+}
+
 /// Error returned when encoding a [`SettleResponse`] into base64 fails.
 ///
 /// This typically occurs if the response cannot be serialized to JSON,
@@ -962,6 +1097,115 @@ impl TryInto<Base64Bytes<'static>> for SettleResponse {
     fn try_into(self) -> Result<Base64Bytes<'static>, Self::Error> {
         let json = serde_json::to_vec(&self).map_err(SettleResponseB64EncodingError)?;
         Ok(Base64Bytes::encode(json))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+    use solana_sdk::pubkey::Pubkey;
+    use url::Url;
+
+    #[test]
+    fn converts_verify_request_into_contract_request() {
+        let from = EvmAddress(address!("0x1111111111111111111111111111111111111111"));
+        let to = EvmAddress(address!("0x2222222222222222222222222222222222222222"));
+        let nonce = HexEncodedNonce([5u8; 32]);
+
+        let authorization = ExactEvmPayloadAuthorization {
+            from,
+            to,
+            value: TokenAmount::from(500_000u64),
+            valid_after: UnixTimestamp(1),
+            valid_before: UnixTimestamp(2),
+            nonce,
+        };
+        let signature_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE];
+
+        let payment_payload = PaymentPayload {
+            x402_version: X402Version::V1,
+            scheme: Scheme::Exact,
+            network: Network::Base,
+            payload: ExactPaymentPayload::Evm(ExactEvmPayload {
+                signature: EvmSignature(signature_bytes.clone()),
+                authorization,
+            }),
+        };
+
+        let payment_requirements = PaymentRequirements {
+            scheme: Scheme::Exact,
+            network: Network::Base,
+            max_amount_required: TokenAmount::from(500_000u64),
+            resource: Url::parse("https://example.com/resource").unwrap(),
+            description: "example".into(),
+            mime_type: "application/json".into(),
+            output_schema: None,
+            pay_to: MixedAddress::Evm(to),
+            max_timeout_seconds: 60,
+            asset: MixedAddress::Evm(to),
+            extra: None,
+        };
+
+        let verify_request = VerifyRequest {
+            x402_version: X402Version::V1,
+            payment_payload,
+            payment_requirements,
+        };
+
+        let contract_request = SettleContractRequest::try_from(&verify_request).unwrap();
+
+        assert_eq!(contract_request.network, Network::Base);
+        assert_eq!(contract_request.from, from);
+        assert_eq!(contract_request.receiver, to);
+        assert_eq!(contract_request.amount, authorization.value);
+        assert_eq!(contract_request.valid_after, authorization.valid_after);
+        assert_eq!(contract_request.valid_before, authorization.valid_before);
+        assert_eq!(contract_request.nonce, nonce.0);
+        assert_eq!(contract_request.signature, signature_bytes);
+        assert_eq!(contract_request.confirmations, 1);
+    }
+
+    #[test]
+    fn reject_solana_network_during_conversion() {
+        let solana_pubkey = Pubkey::new_from_array([7u8; 32]);
+
+        let payment_payload = PaymentPayload {
+            x402_version: X402Version::V1,
+            scheme: Scheme::Exact,
+            network: Network::Solana,
+            payload: ExactPaymentPayload::Solana(ExactSolanaPayload {
+                transaction: "base64-tx".into(),
+            }),
+        };
+
+        let payment_requirements = PaymentRequirements {
+            scheme: Scheme::Exact,
+            network: Network::Solana,
+            max_amount_required: TokenAmount::from(10u64),
+            resource: Url::parse("https://example.com/solana").unwrap(),
+            description: "solana".into(),
+            mime_type: "application/json".into(),
+            output_schema: None,
+            pay_to: MixedAddress::Solana(solana_pubkey),
+            max_timeout_seconds: 60,
+            asset: MixedAddress::Solana(solana_pubkey),
+            extra: None,
+        };
+
+        let verify_request = VerifyRequest {
+            x402_version: X402Version::V1,
+            payment_payload,
+            payment_requirements,
+        };
+
+        let error = SettleContractRequest::try_from(&verify_request)
+            .expect_err("expected conversion to fail for solana network");
+
+        assert!(matches!(
+            error,
+            SettleContractRequestConversionError::UnsupportedNetwork(Network::Solana)
+        ));
     }
 }
 

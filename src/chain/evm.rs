@@ -35,6 +35,7 @@ use alloy::sol_types::{Eip712Domain, SolCall, SolStruct, eip712_domain};
 use alloy::{hex, sol};
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
@@ -69,6 +70,24 @@ sol! {
     #[sol(rpc)]
     Validator6492,
     "abi/Validator6492.json"
+}
+
+sol! {
+    #[allow(missing_docs)]
+    #[allow(clippy::too_many_arguments)]
+    #[derive(Debug)]
+    #[sol(rpc)]
+    interface SettleContract {
+        function settle(
+            address from,
+            address receiver,
+            uint256 amount,
+            uint256 validAfter,
+            uint256 validBefore,
+            bytes32 nonce,
+            bytes calldata signature
+        ) external;
+    }
 }
 
 /// Signature verifier for EIP-6492, EIP-1271, EOA, universally deployed on the supported EVM chains
@@ -224,6 +243,83 @@ impl EvmProvider {
                 self.signer_cursor.fetch_add(1, Ordering::Relaxed) % self.signer_addresses.len();
             self.signer_addresses[next]
         }
+    }
+
+    /// Get the settle contract address from environment variable.
+    ///
+    /// # Errors
+    /// Returns [`FacilitatorLocalError::ContractCall`] if the environment variable is not set
+    /// or if the address cannot be parsed.
+    fn settle_contract_address() -> Result<Address, FacilitatorLocalError> {
+        let addr_str = std::env::var(from_env::ENV_SETTLE_CONTRACT_ADDRESS)
+            .map_err(|e| FacilitatorLocalError::ContractCall(format!(
+                "Failed to read {}: {e}",
+                from_env::ENV_SETTLE_CONTRACT_ADDRESS
+            )))?;
+        Address::from_str(&addr_str).map_err(|e| FacilitatorLocalError::ContractCall(format!(
+            "Invalid settle contract address: {e}"
+        )))
+    }
+
+    /// Call the settle contract function with the provided parameters.
+    ///
+    /// This function constructs a transaction to call the `settle` function on the settle contract,
+    /// using the contract address from the `SETTLE_CONTRACT_ADDRESS` environment variable.
+    ///
+    /// # Parameters
+    ///
+    /// - `from`: The address of the sender
+    /// - `receiver`: The address of the receiver
+    /// - `amount`: The amount to transfer (token units as U256)
+    /// - `valid_after`: Timestamp after which the authorization is valid (inclusive)
+    /// - `valid_before`: Timestamp before which the authorization is valid (exclusive)
+    /// - `nonce`: 32-byte nonce to prevent replay attacks
+    /// - `signature`: Signature bytes for the authorization
+    /// - `confirmations`: Number of block confirmations to wait for (default: 1)
+    ///
+    /// # Returns
+    ///
+    /// A [`TransactionReceipt`] once the transaction has been mined and confirmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacilitatorLocalError::ContractCall`] if:
+    /// - The contract address cannot be read from environment
+    /// - Transaction sending fails
+    /// - Receipt retrieval fails
+    #[instrument(skip(self, signature), err)]
+    pub async fn settle_contract(
+        &self,
+        from: Address,
+        receiver: Address,
+        amount: U256,
+        valid_after: U256,
+        valid_before: U256,
+        nonce: FixedBytes<32>,
+        signature: Bytes,
+        confirmations: u64,
+    ) -> Result<TransactionReceipt, FacilitatorLocalError> {
+        let contract_address = Self::settle_contract_address()?;
+        let contract = SettleContract::new(contract_address, &self.inner);
+        let settle_call = contract.settle(from, receiver, amount, valid_after, valid_before, nonce, signature);
+        
+        self.send_transaction(MetaTransaction {
+            to: settle_call.target(),
+            calldata: settle_call.calldata().clone(),
+            confirmations,
+        })
+        .instrument(tracing::info_span!(
+            "call_settle_contract",
+            from = %from,
+            receiver = %receiver,
+            amount = %amount,
+            valid_after = %valid_after,
+            valid_before = %valid_before,
+            nonce = %hex::encode(nonce),
+            contract_address = %contract_address,
+            otel.kind = "client",
+        ))
+        .await
     }
 }
 

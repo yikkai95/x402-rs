@@ -12,10 +12,12 @@
 use tracing::instrument;
 
 use crate::chain::FacilitatorLocalError;
+use crate::chain::NetworkProvider;
 use crate::facilitator::Facilitator;
 use crate::provider_cache::ProviderMap;
 use crate::types::{
-    SettleRequest, SettleResponse, SupportedPaymentKindsResponse, VerifyRequest, VerifyResponse,
+    SettleRequest, SettleResponse, SettleContractRequest, SettleContractResponse,
+    SupportedPaymentKindsResponse, VerifyRequest, VerifyResponse,
 };
 
 /// A concrete [`Facilitator`] implementation that verifies and settles x402 payments
@@ -33,6 +35,70 @@ impl<A> FacilitatorLocal<A> {
     /// The provider cache is used to resolve the appropriate EVM provider for each payment's target network.
     pub fn new(provider_map: A) -> Self {
         FacilitatorLocal { provider_map }
+    }
+
+    /// Call the settle contract function with the provided parameters.
+    ///
+    /// # Errors
+    /// Returns [`FacilitatorLocalError`] if:
+    /// - The network is not supported
+    /// - The provider is not an EVM provider
+    /// - The contract call fails
+    #[instrument(skip_all, err)]
+    pub async fn settle_contract(
+        &self,
+        request: &SettleContractRequest,
+    ) -> Result<SettleContractResponse, FacilitatorLocalError>
+    where
+        A: ProviderMap<Value = NetworkProvider> + Sync,
+    {
+        let provider = self
+            .provider_map
+            .by_network(request.network)
+            .ok_or(FacilitatorLocalError::UnsupportedNetwork(None))?;
+        
+        // We need to extract EvmProvider from NetworkProvider, but provider is a reference
+        // So we pattern match and borrow the inner value
+        let evm_provider = match provider {
+            NetworkProvider::Evm(evm) => evm,
+            NetworkProvider::Solana(_) => {
+                return Err(FacilitatorLocalError::UnsupportedNetwork(None));
+            }
+        };
+
+        use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+
+        let from: Address = request.from.into();
+        let receiver: Address = request.receiver.into();
+        let amount: U256 = request.amount.into();
+        let valid_after: U256 = request.valid_after.into();
+        let valid_before: U256 = request.valid_before.into();
+        let nonce = FixedBytes(request.nonce);
+        let signature = Bytes::from(request.signature.clone());
+
+        let receipt = evm_provider
+            .settle_contract(
+                from,
+                receiver,
+                amount,
+                valid_after,
+                valid_before,
+                nonce,
+                signature,
+                request.confirmations,
+            )
+            .await?;
+
+        let success = receipt.status();
+        Ok(SettleContractResponse {
+            success,
+            error_reason: if success {
+                None
+            } else {
+                Some(crate::types::FacilitatorErrorReason::InvalidScheme)
+            },
+            transaction: Some(crate::types::TransactionHash::Evm(receipt.transaction_hash.0)),
+        })
     }
 }
 
