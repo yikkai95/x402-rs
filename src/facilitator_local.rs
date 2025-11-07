@@ -27,18 +27,14 @@ use crate::types::{
 /// which enables testing or customization beyond the default [`ProviderCache`].
 pub struct FacilitatorLocal<A> {
     provider_map: A,
-    gas_overrides: crate::chain::evm::GasOverrides,
 }
 
 impl<A> FacilitatorLocal<A> {
     /// Creates a new [`FacilitatorLocal`] with the given provider cache.
     ///
     /// The provider cache is used to resolve the appropriate EVM provider for each payment's target network.
-    pub fn new(provider_map: A, gas_overrides: crate::chain::evm::GasOverrides) -> Self {
-        FacilitatorLocal {
-            provider_map,
-            gas_overrides,
-        }
+    pub fn new(provider_map: A) -> Self {
+        FacilitatorLocal { provider_map }
     }
 
     /// Call the settle contract function with the provided parameters.
@@ -80,8 +76,9 @@ impl<A> FacilitatorLocal<A> {
         let nonce = FixedBytes(request.nonce);
         let signature = Bytes::from(request.signature.clone());
 
-        let mut max_fee_per_gas = self.gas_overrides.max_fee_per_gas;
-        let min_priority_fee = self.gas_overrides.max_priority_fee_per_gas;
+        let gas_overrides = crate::chain::evm::load_gas_overrides_from_redis().await?;
+        let mut max_fee_per_gas = gas_overrides.max_fee_per_gas;
+        let min_priority_fee = gas_overrides.max_priority_fee_per_gas;
         if max_fee_per_gas < min_priority_fee {
             max_fee_per_gas = min_priority_fee;
         }
