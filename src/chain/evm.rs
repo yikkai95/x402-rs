@@ -290,6 +290,8 @@ pub struct EvmProvider {
     signer_addresses: Arc<Vec<Address>>,
     /// Current position in round-robin signer rotation.
     signer_cursor: Arc<AtomicUsize>,
+    /// Shared nonce manager so we can resync cached nonces on demand.
+    nonce_manager: PendingNonceManager,
 }
 
 impl EvmProvider {
@@ -312,7 +314,8 @@ impl EvmProvider {
             .connect(rpc_url)
             .await
             .map_err(|e| format!("Failed to connect to {network}: {e}"))?;
-        let filler = InnerFiller::default();
+        let nonce_manager = PendingNonceManager::default();
+        let filler = Self::build_inner_filler(nonce_manager.clone());
         let inner = ProviderBuilder::default()
             .filler(filler)
             .wallet(wallet)
@@ -326,7 +329,18 @@ impl EvmProvider {
             chain,
             signer_addresses,
             signer_cursor,
+            nonce_manager,
         })
+    }
+
+    fn build_inner_filler(nonce_manager: PendingNonceManager) -> InnerFiller {
+        let gas = GasFiller::default();
+        let blob = BlobGasFiller::default();
+        let nonce = NonceFiller::new(nonce_manager);
+        let chain = ChainIdFiller::default();
+        let nonce_chain = JoinFill::new(nonce, chain);
+        let blob_nonce_chain = JoinFill::new(blob, nonce_chain);
+        JoinFill::new(gas, blob_nonce_chain)
     }
 
     /// Round-robin selection of next signer from wallet.
@@ -362,10 +376,62 @@ impl EvmProvider {
         &self,
         tx: &MetaTransaction,
     ) -> Result<PendingTransactionBuilder<AlloyEthereum>, FacilitatorLocalError> {
+        let from = self.next_signer_address();
+        let initial_request = self.build_transaction_request(tx, from, None).await?;
+
+        match self.inner.send_transaction(initial_request).await {
+            Ok(pending) => Ok(pending),
+            Err(err) => {
+                let err_str = format!("{err:?}");
+                if Self::is_nonce_too_low_error(&err_str) {
+                    let latest_nonce = self
+                        .inner
+                        .get_transaction_count(from)
+                        .pending()
+                        .await
+                        .map_err(|e| {
+                            FacilitatorLocalError::ContractCall(format!(
+                                "Failed to refresh nonce after nonce-too-low error: {e:?}"
+                            ))
+                        })?;
+                    tracing::warn!(
+                        %from,
+                        latest_nonce,
+                        error = %err_str,
+                        "Nonce too low, retrying with latest nonce"
+                    );
+                    self.nonce_manager.overwrite_nonce(from, latest_nonce).await;
+                    let retry_request = self
+                        .build_transaction_request(tx, from, Some(latest_nonce))
+                        .await?;
+                    self.inner
+                        .send_transaction(retry_request)
+                        .await
+                        .map_err(|retry_err| {
+                            FacilitatorLocalError::ContractCall(format!("{retry_err:?}"))
+                        })
+                } else {
+                    Err(FacilitatorLocalError::ContractCall(err_str))
+                }
+            }
+        }
+    }
+
+    async fn build_transaction_request(
+        &self,
+        tx: &MetaTransaction,
+        from: Address,
+        nonce_override: Option<u64>,
+    ) -> Result<TransactionRequest, FacilitatorLocalError> {
         let mut txr = TransactionRequest::default()
             .with_to(tx.to)
-            .with_from(self.next_signer_address())
+            .with_from(from)
             .with_input(tx.calldata.clone());
+
+        if let Some(nonce) = nonce_override {
+            txr.set_nonce(nonce);
+        }
+
         if self.eip1559 {
             let priority = tx.max_priority_fee_per_gas.unwrap_or(MIN_PRIORITY_FEE_WEI);
             txr.set_max_priority_fee_per_gas(priority);
@@ -373,8 +439,8 @@ impl EvmProvider {
                 txr.set_max_fee_per_gas(max_fee.max(priority));
             }
         } else {
-            let provider = &self.inner;
-            let gas: u128 = provider
+            let gas: u128 = self
+                .inner
                 .get_gas_price()
                 .instrument(tracing::info_span!("get_gas_price"))
                 .await
@@ -382,10 +448,11 @@ impl EvmProvider {
             txr.set_gas_price(gas);
         }
 
-        self.inner
-            .send_transaction(txr)
-            .await
-            .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))
+        Ok(txr)
+    }
+
+    fn is_nonce_too_low_error(err: &str) -> bool {
+        err.contains("nonce too low")
     }
 
     pub async fn broadcast_transaction(
@@ -1444,5 +1511,16 @@ impl NonceManager for PendingNonceManager {
         };
         *nonce = new_nonce;
         Ok(new_nonce)
+    }
+}
+
+impl PendingNonceManager {
+    async fn overwrite_nonce(&self, address: alloy::primitives::Address, latest_nonce: u64) {
+        let nonce_entry = self
+            .nonces
+            .entry(address)
+            .or_insert_with(|| Arc::new(Mutex::new(latest_nonce)));
+        let mut nonce = nonce_entry.value().lock().await;
+        *nonce = latest_nonce;
     }
 }
