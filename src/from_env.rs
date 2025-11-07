@@ -24,6 +24,10 @@ pub const ENV_RPC_SEI: &str = "RPC_URL_SEI";
 pub const ENV_RPC_SEI_TESTNET: &str = "RPC_URL_SEI_TESTNET";
 
 pub const ENV_SETTLE_CONTRACT_ADDRESS: &str = "SETTLE_CONTRACT_ADDRESS";
+#[allow(dead_code)]
+pub const ENV_UPSTASH_REDIS_URL: &str = "UPSTASH_REDIS_URL";
+#[allow(dead_code)]
+pub const ENV_UPSTASH_REDIS_TOKEN: &str = "UPSTASH_REDIS_TOKEN";
 
 pub fn rpc_env_name_from_network(network: Network) -> &'static str {
     match network {
