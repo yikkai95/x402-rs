@@ -98,125 +98,97 @@ const VALIDATOR_ADDRESS: alloy::primitives::Address =
     address!("0xdAcD51A54883eb67D95FAEb2BBfdC4a9a6BD2a3B");
 
 /// Minimum priority fee to keep transaction tips around one cent for ~90k gas (Base @ ~$3k/ETH).
-const MIN_PRIORITY_FEE_WEI: u128 = 20_000_000; // 2 gwei
+const MIN_PRIORITY_FEE_WEI: u128 = 2_000_000_000; // 2 gwei
 
-/// Fetches the minimum priority fee from Upstash Redis using the nonce as the key.
-///
-/// The value stored in Redis is in gwei and will be converted to wei.
-///
-/// # Arguments
-///
-/// * `nonce` - The nonce to use as the Redis key (as a hex-encoded string)
-///
-/// # Returns
-///
-/// Returns the minimum priority fee in wei, or falls back to [`MIN_PRIORITY_FEE_WEI`] if:
-/// - Redis is not configured (environment variables not set)
-/// - The fetch fails
-/// - The value cannot be parsed
-///
-/// # Errors
-///
-/// This function logs errors but does not return them, always returning a valid fee value.
-#[instrument(skip_all)]
-pub async fn fetch_min_priority_fee_from_redis(nonce: &str) -> u128 {
-    let redis_url = match std::env::var(from_env::ENV_UPSTASH_REDIS_URL) {
-        Ok(url) => url,
-        Err(_) => {
-            tracing::debug!("UPSTASH_REDIS_URL not set, using default MIN_PRIORITY_FEE_WEI");
-            return MIN_PRIORITY_FEE_WEI;
-        }
-    };
+#[derive(Clone, Copy, Debug)]
+pub struct GasOverrides {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
 
-    let redis_token = match std::env::var(from_env::ENV_UPSTASH_REDIS_TOKEN) {
-        Ok(token) => token,
-        Err(_) => {
-            tracing::debug!("UPSTASH_REDIS_TOKEN not set, using default MIN_PRIORITY_FEE_WEI");
-            return MIN_PRIORITY_FEE_WEI;
-        }
-    };
+/// Fetches `maxFeePerGas` and `maxPriorityFeePerGas` (in gwei) from Upstash Redis.
+///
+/// Redis stores the values as strings inside a JSON payload returned from `/get/gas_fees`.
+/// We convert them to wei and surface any failure as a [`FacilitatorLocalError`], forcing
+/// callers to fix their config instead of silently falling back to unsafe defaults.
+pub async fn load_gas_overrides_from_redis() -> Result<GasOverrides, FacilitatorLocalError> {
+    let redis_url = std::env::var(from_env::ENV_UPSTASH_REDIS_URL)
+        .map_err(|_| FacilitatorLocalError::ContractCall("UPSTASH_REDIS_URL not set".into()))?;
+    let redis_token = std::env::var(from_env::ENV_UPSTASH_REDIS_TOKEN)
+        .map_err(|_| FacilitatorLocalError::ContractCall("UPSTASH_REDIS_TOKEN not set".into()))?;
 
-    let url = format!("{}/get/{}", redis_url.trim_end_matches('/'), nonce);
-    
+    let url = format!("{}/get/gas_fees", redis_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let response = match client
+    let response = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", redis_token))
         .send()
         .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(error = %e, nonce = nonce, "Failed to fetch min priority fee from Redis");
-            return MIN_PRIORITY_FEE_WEI;
-        }
-    };
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to call Redis for gas overrides");
+            FacilitatorLocalError::ContractCall("Failed to fetch gas overrides".into())
+        })?;
 
     if !response.status().is_success() {
-        tracing::warn!(
-            status = %response.status(),
-            nonce = nonce,
-            "Redis returned non-success status"
-        );
-        return MIN_PRIORITY_FEE_WEI;
+        tracing::error!(status = %response.status(), "Redis returned error for gas overrides");
+        return Err(FacilitatorLocalError::ContractCall(
+            "Redis gas override request failed".into(),
+        ));
     }
 
     #[derive(Deserialize)]
     struct RedisResponse {
-        #[allow(dead_code)]
         result: Option<String>,
     }
 
-    let redis_resp: RedisResponse = match response.json().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(error = %e, nonce = nonce, "Failed to parse Redis response");
-            return MIN_PRIORITY_FEE_WEI;
-        }
-    };
+    let redis_resp: RedisResponse = response.json().await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to parse Redis response");
+        FacilitatorLocalError::ContractCall("Failed to parse Redis gas response".into())
+    })?;
 
-    let value_str = match redis_resp.result {
-        Some(v) => v,
-        None => {
-            tracing::debug!(nonce = nonce, "No value found in Redis for nonce, using default");
-            return MIN_PRIORITY_FEE_WEI;
-        }
-    };
+    let value_str = redis_resp.result.ok_or_else(|| {
+        tracing::error!("Redis gas override response missing result");
+        FacilitatorLocalError::ContractCall("Redis gas override missing result".into())
+    })?;
 
-    // Parse the value as a float (gwei) and convert to wei
-    let gwei_value: f64 = match value_str.parse() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                value = %value_str,
-                nonce = nonce,
-                "Failed to parse Redis value as number"
-            );
-            return MIN_PRIORITY_FEE_WEI;
-        }
-    };
+    #[derive(Deserialize)]
+    struct GasFeeOverrides {
+        #[serde(rename = "maxFeePerGas")]
+        max_fee_per_gas: String,
+        #[serde(rename = "maxPriorityFeePerGas")]
+        max_priority_fee_per_gas: String,
+    }
 
-    // Convert gwei to wei (1 gwei = 1e9 wei)
-    let wei_value = (gwei_value * 1_000_000_000.0) as u128;
-    
-    tracing::debug!(
-        nonce = nonce,
-        gwei = gwei_value,
-        wei = wei_value,
-        "Fetched min priority fee from Redis"
+    let overrides: GasFeeOverrides = serde_json::from_str(&value_str).map_err(|e| {
+        tracing::error!(error = %e, value = %value_str, "Failed to parse gas override JSON");
+        FacilitatorLocalError::ContractCall("Invalid gas override JSON".into())
+    })?;
+
+    fn gwei_str_to_wei(value: &str) -> Result<u128, FacilitatorLocalError> {
+        value
+            .parse::<f64>()
+            .map(|gwei| (gwei * 1_000_000_000.0) as u128)
+            .map_err(|e| {
+                tracing::error!(error = %e, value = value, "Failed to parse gwei value");
+                FacilitatorLocalError::ContractCall("Invalid gas override value".into())
+            })
+    }
+
+    let max_fee = gwei_str_to_wei(&overrides.max_fee_per_gas)?;
+    let max_priority = gwei_str_to_wei(&overrides.max_priority_fee_per_gas)?;
+
+    tracing::info!(
+        max_fee_per_gas_gwei = %overrides.max_fee_per_gas,
+        max_priority_fee_per_gas_gwei = %overrides.max_priority_fee_per_gas,
+        max_fee_per_gas_wei = max_fee,
+        max_priority_fee_per_gas_wei = max_priority,
+        "Fetched gas overrides from Redis"
     );
 
-    wei_value
-}
-
-/// Convenience function to fetch min priority fee using a [`HexEncodedNonce`].
-///
-/// This converts the nonce to a hex-encoded string and calls [`fetch_min_priority_fee_from_redis`].
-#[instrument(skip_all)]
-pub async fn fetch_min_priority_fee_from_redis_with_nonce(nonce: &HexEncodedNonce) -> u128 {
-    let nonce_hex = hex::encode(nonce.0);
-    fetch_min_priority_fee_from_redis(&nonce_hex).await
+    Ok(GasOverrides {
+        max_fee_per_gas: max_fee,
+        max_priority_fee_per_gas: max_priority,
+    })
 }
 
 /// Combined filler type for gas, blob gas, nonce, and chain ID.
@@ -395,7 +367,11 @@ impl EvmProvider {
             .with_from(self.next_signer_address())
             .with_input(tx.calldata.clone());
         if self.eip1559 {
-            txr.set_max_priority_fee_per_gas(MIN_PRIORITY_FEE_WEI);
+            let priority = tx.max_priority_fee_per_gas.unwrap_or(MIN_PRIORITY_FEE_WEI);
+            txr.set_max_priority_fee_per_gas(priority);
+            if let Some(max_fee) = tx.max_fee_per_gas {
+                txr.set_max_fee_per_gas(max_fee.max(priority));
+            }
         } else {
             let provider = &self.inner;
             let gas: u128 = provider
@@ -456,6 +432,8 @@ impl EvmProvider {
         nonce: FixedBytes<32>,
         signature: Bytes,
         confirmations: u64,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
     ) -> Result<TransactionReceipt, FacilitatorLocalError> {
         let contract_address = Self::settle_contract_address()?;
         let contract = SettleContract::new(contract_address, &self.inner);
@@ -473,6 +451,8 @@ impl EvmProvider {
             to: settle_call.target(),
             calldata: settle_call.calldata().clone(),
             confirmations,
+            max_fee_per_gas: Some(max_fee_per_gas),
+            max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
         })
         .instrument(tracing::info_span!(
             "call_settle_contract",
@@ -499,6 +479,8 @@ impl EvmProvider {
         nonce: FixedBytes<32>,
         signature: Bytes,
         confirmations: u64,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
     ) -> Result<[u8; 32], FacilitatorLocalError> {
         let contract_address = Self::settle_contract_address()?;
         let contract = SettleContract::new(contract_address, &self.inner);
@@ -517,6 +499,8 @@ impl EvmProvider {
                 to: settle_call.target(),
                 calldata: settle_call.calldata().clone(),
                 confirmations,
+                max_fee_per_gas: Some(max_fee_per_gas),
+                max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
             })
             .instrument(tracing::info_span!(
                 "call_settle_contract",
@@ -562,6 +546,10 @@ pub struct MetaTransaction {
     pub calldata: Bytes,
     /// Number of block confirmations to wait for.
     pub confirmations: u64,
+    /// Optional override for max fee per gas (wei).
+    pub max_fee_per_gas: Option<u128>,
+    /// Optional override for max priority fee per gas (wei).
+    pub max_priority_fee_per_gas: Option<u128>,
 }
 
 impl MetaEvmProvider for EvmProvider {
@@ -795,6 +783,8 @@ where
                         to: transfer_call.tx.target(),
                         calldata: transfer_call.tx.calldata().clone(),
                         confirmations: 1,
+                        max_fee_per_gas: None,
+                        max_priority_fee_per_gas: None,
                     })
                     .instrument(
                         tracing::info_span!("call_transferWithAuthorization_0",
@@ -829,6 +819,8 @@ where
                         to: MULTICALL3_ADDRESS,
                         calldata: aggregate_call.abi_encode().into(),
                         confirmations: 1,
+                        max_fee_per_gas: None,
+                        max_priority_fee_per_gas: None,
                     })
                     .instrument(
                         tracing::info_span!("call_transferWithAuthorization_0",
@@ -854,6 +846,8 @@ where
                     to: transfer_call.tx.target(),
                     calldata: transfer_call.tx.calldata().clone(),
                     confirmations: 1,
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
                 })
                 .instrument(
                     tracing::info_span!("call_transferWithAuthorization_0",

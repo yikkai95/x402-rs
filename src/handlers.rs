@@ -74,7 +74,7 @@ pub async fn get_settle_info() -> impl IntoResponse {
                 "validBefore": "UnixTimestamp",
                 "nonce": "hex-encoded bytes32",
                 "signature": "hex-encoded bytes",
-                "confirmations": "u64 (optional, default: 1)",
+                "confirmations": "u64 (optional, default: 0)",
             }
         }
     }))

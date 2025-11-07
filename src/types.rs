@@ -964,7 +964,7 @@ pub struct SettleContractRequest {
     /// Signature bytes, hex-encoded.
     #[serde(with = "hex_serde")]
     pub signature: Vec<u8>,
-    /// Number of block confirmations to wait for (default: 1).
+    /// Number of block confirmations to wait for (default: 0).
     #[serde(default = "default_confirmations")]
     pub confirmations: u64,
 }
@@ -1175,7 +1175,7 @@ mod tests {
         );
         assert_eq!(expected_from_payload.nonce, nonce.0);
         assert_eq!(expected_from_payload.signature, signature_bytes);
-        assert_eq!(expected_from_payload.confirmations, 1);
+        assert_eq!(expected_from_payload.confirmations, 0);
 
         assert_eq!(expected_from_payload.network, expected_from_verify.network);
         assert_eq!(expected_from_payload.from, expected_from_verify.from);

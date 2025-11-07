@@ -71,7 +71,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    let facilitator = FacilitatorLocal::new(provider_cache);
+    let gas_overrides = match crate::chain::evm::load_gas_overrides_from_redis().await {
+        Ok(overrides) => overrides,
+        Err(e) => {
+            tracing::error!("Failed to load gas overrides: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let facilitator = FacilitatorLocal::new(provider_cache, gas_overrides);
     let axum_state = Arc::new(facilitator);
 
     let http_endpoints = Router::new()
