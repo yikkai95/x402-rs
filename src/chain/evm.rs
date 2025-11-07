@@ -385,22 +385,14 @@ impl EvmProvider {
                 let err_str = format!("{err:?}");
                 if Self::is_nonce_too_low_error(&err_str) {
                     let latest_nonce = self
-                        .inner
-                        .get_transaction_count(from)
-                        .pending()
-                        .await
-                        .map_err(|e| {
-                            FacilitatorLocalError::ContractCall(format!(
-                                "Failed to refresh nonce after nonce-too-low error: {e:?}"
-                            ))
-                        })?;
+                        .sync_nonce_from_chain(from, "nonce-too-low error")
+                        .await?;
                     tracing::warn!(
                         %from,
                         latest_nonce,
                         error = %err_str,
                         "Nonce too low, retrying with latest nonce"
                     );
-                    self.nonce_manager.overwrite_nonce(from, latest_nonce).await;
                     let retry_request = self
                         .build_transaction_request(tx, from, Some(latest_nonce))
                         .await?;
@@ -411,10 +403,42 @@ impl EvmProvider {
                             FacilitatorLocalError::ContractCall(format!("{retry_err:?}"))
                         })
                 } else {
+                    if let Err(sync_err) = self
+                        .sync_nonce_from_chain(from, "transaction send error")
+                        .await
+                    {
+                        tracing::warn!(
+                            %from,
+                            error = ?sync_err,
+                            original_error = %err_str,
+                            "Failed to refresh nonce after send error",
+                        );
+                    }
                     Err(FacilitatorLocalError::ContractCall(err_str))
                 }
             }
         }
+    }
+
+    async fn sync_nonce_from_chain(
+        &self,
+        address: Address,
+        context: &str,
+    ) -> Result<u64, FacilitatorLocalError> {
+        let latest_nonce = self
+            .inner
+            .get_transaction_count(address)
+            .pending()
+            .await
+            .map_err(|e| {
+                FacilitatorLocalError::ContractCall(format!(
+                    "Failed to refresh nonce after {context}: {e:?}"
+                ))
+            })?;
+        self.nonce_manager
+            .overwrite_nonce(address, latest_nonce)
+            .await;
+        Ok(latest_nonce)
     }
 
     async fn build_transaction_request(
