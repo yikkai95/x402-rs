@@ -14,17 +14,23 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router, response::IntoResponse};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::instrument;
 
 use crate::chain::FacilitatorLocalError;
+use crate::chain::NetworkProvider;
 use crate::facilitator::Facilitator;
 use crate::facilitator_local::FacilitatorLocal;
+use crate::network::Network;
+use crate::provider_cache::ProviderCache;
 use crate::types::{
     ErrorResponse, FacilitatorErrorReason, MixedAddress, PaymentPayload, SettleContractRequest,
     SettleContractRequestConversionError, SettleContractResponse, SettleRequest, SettleResponse,
     VerifyRequest, VerifyResponse,
 };
+use alloy::primitives::{Address, Bytes};
+use alloy::hex;
 
 /// `GET /verify`: Returns a machine-readable description of the `/verify` endpoint.
 ///
@@ -80,9 +86,27 @@ pub async fn get_settle_info() -> impl IntoResponse {
     }))
 }
 
+/// `GET /call`: Returns a machine-readable description of the `/call` endpoint.
+///
+/// This is served by the facilitator to help clients understand how to construct
+/// a valid [`ContractCallRequest`] for universal EVM contract call submission.
+#[instrument(skip_all)]
+pub async fn get_call_info() -> impl IntoResponse {
+    Json(json!({
+        "endpoint": "/call",
+        "description": "POST to submit universal EVM contract calls",
+        "body": {
+            "network": "Network",
+            "to": "EvmAddress (target contract address)",
+            "data": "hex-encoded calldata (with or without 0x prefix)",
+            "confirmations": "u64 (optional, default: 1)",
+        }
+    }))
+}
+
 pub fn routes<A>() -> Router<A>
 where
-    A: Facilitator + Clone + Send + Sync + 'static,
+    A: Facilitator + Clone + Send + Sync + 'static + AsRef<FacilitatorLocal<ProviderCache>>,
     A::Error: IntoResponse,
 {
     Router::new()
@@ -91,6 +115,8 @@ where
         .route("/verify", post(post_verify::<A>))
         .route("/settle", get(get_settle_info))
         .route("/settle", post(post_settle::<A>))
+        .route("/call", get(get_call_info))
+        .route("/call", post(post_contract_call::<A>))
         .route("/health", get(get_health::<A>))
         .route("/supported", get(get_supported::<A>))
 }
@@ -435,6 +461,107 @@ where
     }
 }
 
+/// `POST /call`: Universal EVM contract call submission.
+///
+/// Accepts raw calldata and target address, sends a transaction using the facilitator's signer set
+/// with round-robin selection and nonce management. Returns a receipt summary.
+#[instrument(skip_all)]
+pub async fn post_contract_call<A>(
+    State(facilitator): State<A>,
+    Json(body): Json<ContractCallRequest>,
+) -> impl IntoResponse
+where
+    A: Facilitator + AsRef<FacilitatorLocal<ProviderCache>>,
+    A::Error: IntoResponse,
+{
+    let facilitator_ref: &FacilitatorLocal<ProviderCache> = facilitator.as_ref();
+    let provider = match facilitator_ref.provider_by_network(body.network) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Unsupported or unconfigured network".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let confirmations = body.confirmations.unwrap_or(1);
+    let to: Address = match body.to.parse() {
+        Ok(addr) => addr,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid 'to' address".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Accept both 0x-prefixed and non-prefixed hex
+    let hex_data = body.data.trim_start_matches("0x");
+    let calldata: Bytes = match hex::decode(hex_data) {
+        Ok(b) => b.into(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid hex in 'data'".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match provider {
+        NetworkProvider::Evm(evm) => {
+            use crate::chain::evm::{MetaEvmProvider, MetaTransaction};
+            let meta = MetaTransaction {
+                to,
+                calldata,
+                confirmations,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+            };
+
+            let receipt = match evm.send_transaction(meta).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "contract call send failed");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("Send failed: {e}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+
+            let tx_hash = format!("0x{}", hex::encode(receipt.transaction_hash.0));
+            let response = json!({
+                "success": receipt.status(),
+                "txHash": tx_hash,
+                "network": body.network.to_string(),
+                "to": format!("{to}"),
+            });
+
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        NetworkProvider::Solana(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "/call supports only EVM networks".to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// Helper function to try calling settle_contract if the facilitator is FacilitatorLocal wrapped in Arc
 async fn try_settle_contract<A>(
     facilitator: &A,
@@ -458,6 +585,15 @@ where
             "Settle contract requires FacilitatorLocal (wrapped in Arc)".to_string(),
         ))
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ContractCallRequest {
+    network: Network,
+    to: String,
+    data: String,
+    #[serde(default)]
+    confirmations: Option<u64>,
 }
 
 fn invalid_schema(payer: Option<MixedAddress>) -> VerifyResponse {

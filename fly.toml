@@ -4,7 +4,7 @@
 #
 
 app = 'x402-rs'
-primary_region = 'sin'
+primary_region = 'fra'
 
 [build]
 

@@ -14,6 +14,7 @@ use tracing::instrument;
 use crate::chain::FacilitatorLocalError;
 use crate::chain::NetworkProvider;
 use crate::facilitator::Facilitator;
+use crate::network::Network;
 use crate::provider_cache::ProviderMap;
 use crate::types::{
     SettleContractRequest, SettleContractResponse, SettleRequest, SettleResponse,
@@ -35,6 +36,17 @@ impl<A> FacilitatorLocal<A> {
     /// The provider cache is used to resolve the appropriate EVM provider for each payment's target network.
     pub fn new(provider_map: A) -> Self {
         FacilitatorLocal { provider_map }
+    }
+
+    /// Returns the network provider for the specified network, if configured.
+    ///
+    /// This is useful for endpoints that need direct access to the provider
+    /// (e.g., for raw contract calls).
+    pub fn provider_by_network(&self, network: Network) -> Option<&NetworkProvider>
+    where
+        A: ProviderMap<Value = NetworkProvider>,
+    {
+        self.provider_map.by_network(network)
     }
 
     /// Call the settle contract function with the provided parameters.
