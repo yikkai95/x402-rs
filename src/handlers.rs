@@ -608,8 +608,6 @@ struct ContractCallRequest {
     network: Network,
     to: String,
     data: String,
-    #[serde(default)]
-    confirmations: Option<u64>,
 }
 
 fn invalid_schema(payer: Option<MixedAddress>) -> VerifyResponse {
