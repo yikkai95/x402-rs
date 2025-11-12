@@ -29,8 +29,8 @@ use crate::types::{
     SettleContractRequestConversionError, SettleContractResponse, SettleRequest, SettleResponse,
     VerifyRequest, VerifyResponse,
 };
-use alloy::primitives::{Address, Bytes};
 use alloy::hex;
+use alloy::primitives::{Address, Bytes};
 
 /// `GET /verify`: Returns a machine-readable description of the `/verify` endpoint.
 ///
@@ -488,7 +488,7 @@ where
         }
     };
 
-    let confirmations = body.confirmations.unwrap_or(1);
+    let confirmations = 0;
     let to: Address = match body.to.parse() {
         Ok(addr) => addr,
         Err(_) => {
@@ -519,38 +519,54 @@ where
 
     match provider {
         NetworkProvider::Evm(evm) => {
-            use crate::chain::evm::{MetaEvmProvider, MetaTransaction};
+            use crate::chain::evm::{
+                MetaTransaction, load_gas_overrides_from_redis,
+            };
+
+            let gas_overrides = match load_gas_overrides_from_redis().await {
+                Ok(overrides) => overrides,
+                Err(err) => return err.into_response(),
+            };
+
+            let mut max_fee_per_gas = gas_overrides.max_fee_per_gas;
+            let min_priority_fee = gas_overrides.max_priority_fee_per_gas;
+            if max_fee_per_gas < min_priority_fee {
+                max_fee_per_gas = min_priority_fee;
+            }
+
             let meta = MetaTransaction {
                 to,
                 calldata,
                 confirmations,
-                max_fee_per_gas: None,
-                max_priority_fee_per_gas: None,
+                max_fee_per_gas: Some(max_fee_per_gas),
+                max_priority_fee_per_gas: Some(min_priority_fee),
             };
 
-            let receipt = match evm.send_transaction(meta).await {
-                Ok(r) => r,
+            let pending = match evm.broadcast_transaction(meta).await {
+                Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(error = ?e, "contract call send failed");
+                    tracing::warn!(error = ?e, "contract call broadcast failed");
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
-                            error: format!("Send failed: {e}"),
+                            error: format!("Broadcast failed: {e}"),
                         }),
                     )
                         .into_response();
                 }
             };
 
-            let tx_hash = format!("0x{}", hex::encode(receipt.transaction_hash.0));
+            let tx_hash_bytes: [u8; 32] = (*pending.tx_hash()).into();
             let response = json!({
-                "success": receipt.status(),
-                "txHash": tx_hash,
+                "success": true,
+                "pending": true,
+                "txHash": format!("0x{}", hex::encode(tx_hash_bytes)),
                 "network": body.network.to_string(),
                 "to": format!("{to}"),
+                "confirmations": confirmations,
             });
 
-            (StatusCode::OK, Json(response)).into_response()
+            return (StatusCode::ACCEPTED, Json(response)).into_response();
         }
         NetworkProvider::Solana(_) => (
             StatusCode::BAD_REQUEST,
